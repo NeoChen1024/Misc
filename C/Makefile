@@ -1,6 +1,6 @@
 CC	= cc
 INCS	= -I/usr/local/include -L/usr/local/lib
-CFLAGS	= -O3 -ffast-math -g -Wall -Wextra -pipe -fPIE -fPIC -fopenmp -std=c17 -pedantic $(INCS)
+CFLAGS	= -Ofast -g -Wall -Wextra -pipe -fPIE -fPIC -fopenmp -std=c17 -pedantic $(INCS)
 LDLIBS	= -lgmp -lmpfr -lm
 EXE	= epoch hex_epoch neodate ackermann \
 	  prime fastfib approx circle simpleturtle pi-omp pi-fast us ns notfib \
