@@ -52,9 +52,9 @@ double log2fractorial(word_t n)
 	return log2(2 * M_PI)/2 + log2(n) * (n + 0.5) - n / log(2);
 }
 
-volatile word_t ctr = 0;
+volatile word_t current_progress = 0;
 volatile word_t secs = 0;
-word_t terms = 5;
+volatile word_t end_progress = 0;
 
 // display progress based on ctr/terms
 void display(union sigval sigval)
@@ -63,18 +63,18 @@ void display(union sigval sigval)
 	(void)sigval;
 
 	static word_t last = 0;
-	if(last > terms)
+	if(last > end_progress)
 		last = 0;
 
 	secs += 1;
 	fprintf(stderr, ">%7.3f%% (%" PRIu64 "/%" PRIu64 ") @ %zu op/s (%zu op/s avg.)\n",
-		(float)ctr * 100 / terms,
-		ctr,
-		terms,
-		ctr - last,
-		ctr / secs
+		(float)current_progress * 100 / end_progress,
+		current_progress,
+		end_progress,
+		current_progress - last,
+		current_progress / secs
 	);
-	last = ctr;
+	last = current_progress;
 }
 
 size_t to_decimal_precision(size_t n, size_t word_size)
@@ -109,8 +109,8 @@ void print_fraction(word_t *frac, size_t n, size_t digits, word_t intensity)
 	word_t carrys[intensity];
 
 	// new progress
-	ctr = 0;
-	terms = digits/GROUP_SIZE;
+	current_progress = 0;
+	end_progress = digits/GROUP_SIZE;
 	// in groups of digits
 	for(size_t i = 0; i < digits/(GROUP_SIZE * intensity); i++)
 	{
@@ -124,7 +124,7 @@ void print_fraction(word_t *frac, size_t n, size_t digits, word_t intensity)
 		for(size_t j = 0; j < intensity; j++)
 			printf("%019" PRIu64, carrys[j]);
 		
-		ctr += intensity;
+		current_progress += intensity;
 	}
 
 	size_t rest = digits % (GROUP_SIZE * intensity);
@@ -140,7 +140,7 @@ void print_fraction(word_t *frac, size_t n, size_t digits, word_t intensity)
 	}
 	for(size_t j = 0; j < rest_intensity; j++)
 		printf("%019" PRIu64, carrys[j]);
-	ctr += rest_intensity;
+	current_progress += rest_intensity;
 
 	rest %= GROUP_SIZE;
 	char fmtspec[32];
@@ -168,11 +168,9 @@ void print_fraction(word_t *frac, size_t n, size_t digits, word_t intensity)
 	if(divisor <= 1)
 		return 0;
 
-	dword_t tmp_partial_dividend = (dword_t)remainder << WORD_SIZE;
-	tmp_partial_dividend |= efrac[current];
+	dword_t tmp_partial_dividend = ((dword_t)remainder << WORD_SIZE) | efrac[current];
 	efrac[current] = tmp_partial_dividend / divisor;
-	tmp_partial_dividend %= divisor;
-	return (word_t)tmp_partial_dividend;
+	return tmp_partial_dividend % divisor;
  }
 
  static inline void efrac_calc(word_t * restrict efrac, size_t start, size_t end, word_t divisor, word_t * restrict remainders, word_t intensity)
@@ -235,7 +233,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
 				remainders[0][i] = 1;
 			}
 			efrac_calc(efrac, 0, efrac_size, divisor, remainders[0], intensity);
-			ctr += intensity;
+			current_progress += intensity;
 		}
 
 		word_t remaining_divisor = terms % intensity;
@@ -245,7 +243,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
 			remainders[0][i] = 1;
 		}
 		efrac_calc(efrac, 0, efrac_size, remaining_divisor, remainders[0], remaining_divisor);
-		ctr += remaining_divisor;
+		current_progress += remaining_divisor;
 
 	}
 	else
@@ -259,7 +257,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
 			divisors_pipeline[0] = divisor;
 
 			ecalc_parallel(efrac_size, efrac, intensity, remainders, divisors_pipeline);
-			ctr += intensity;
+			current_progress += intensity;
 		}
 
 		// finish the pipeline
@@ -277,7 +275,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
 		divisors_pipeline[0] = remaining_intensity;
 
 		ecalc_parallel(efrac_size, efrac, remaining_intensity, remainders, divisors_pipeline);
-		ctr += remaining_intensity;
+		current_progress += remaining_intensity;
 	
 		fprintf(stderr, "Finalizing...\n");
 		// finish the pipeline for remaining divisors
@@ -294,6 +292,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
 
 int main(int argc, char **argv)
 {
+	word_t terms = 5;
 	word_t intensity = 1;
 	if(argc >= 2)
 	{
@@ -317,6 +316,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	end_progress = terms;
+
+	// estimate required precision
 	double precision = log2fractorial(terms);
 	fprintf(stderr, "estimated required precision: log2(%" PRIu64 "!) ~= %lfbits\n", terms, precision);
 	
@@ -344,7 +346,7 @@ int main(int argc, char **argv)
 		.it_interval.tv_nsec=000000000L
 	};
 
-	ctr = 0;
+	current_progress = 0;
 	timer_settime(timer, TIMER_ABSTIME, &period, NULL);
 
 	// calculate e
@@ -354,7 +356,7 @@ int main(int argc, char **argv)
 
 	// Print the result
 	secs = 0;
-	ctr = 0;
+	current_progress = 0;
 
 	fprintf(stderr, "Printing...\n");
 	printf("e = 2.");
