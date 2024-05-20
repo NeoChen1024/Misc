@@ -18,4 +18,5 @@ e-normal
 e-pipeline
 logfactorial
 rand_blast
+nvidia-set-fanspeed
 *.txt
