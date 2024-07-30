@@ -135,15 +135,18 @@ int main(int argc, char *argv[])
 	timer_settime(timer, TIMER_ABSTIME, &period, NULL);
 
 	#pragma omp parallel for shared(bin, len)
-	for(size_t i = 0; i <= UINT_MAX; i++)
+	for(int64_t i = 0; i < (1ULL<<32); i+= (1<<16))
 	{
-		if(unlikely(match((unsigned int)i, bin, len)))
+		for(int64_t j = 0; j < (1<<16); j++)
 		{
-			printf("Seed found: %u\n", (unsigned int)i);
-			// exit(0);
+			if(unlikely(match(i + j, bin, len)))
+			{
+				printf("Seed found: %u\n", (unsigned int)i);
+				// exit(0);
+			}
 		}
 		#pragma omp atomic
-		ctr++;
+		ctr += (1<<16);
 	}
 	printf("Seed not found\n");
 	timer_delete(timer);
