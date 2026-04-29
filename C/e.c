@@ -173,6 +173,11 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits, FILE *out)
         }
 
         fprintf(out, "%019" PRIu64, running_carry);
+        /* add newline every 4 groups */
+        if((current_progress & 0x3) == 0)
+        {
+            fputc('\n', out);
+        }
         current_progress++;
 
         /* Swap src/dst for next iteration */
