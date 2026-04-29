@@ -23,8 +23,22 @@
 #include <inttypes.h>
 #include <assert.h>
 #include <string.h>
+#include <getopt.h>
 #include <unistd.h>
 #include <omp.h>
+
+#if defined(__linux__)
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#ifndef SYS_futex
+#ifdef __NR_futex
+#define SYS_futex __NR_futex
+#endif
+#endif
+#define HAVE_MXI_BACKEND 1
+#else
+#define HAVE_MXI_BACKEND 0
+#endif
 
 #define true	1
 #define false	0
@@ -39,6 +53,17 @@ typedef uint64_t word_t;
 typedef __uint128_t dword_t;
 typedef uint8_t byte;
 
+typedef enum {
+    CALC_BACKEND_LEGACY = 0,
+    CALC_BACKEND_MXI = 1,
+} calc_backend_t;
+
+#if HAVE_MXI_BACKEND
+#define DEFAULT_CALC_BACKEND CALC_BACKEND_MXI
+#else
+#define DEFAULT_CALC_BACKEND CALC_BACKEND_LEGACY
+#endif
+
 /* Global options */
 struct {
     word_t terms;
@@ -46,18 +71,67 @@ struct {
     size_t tile_words;
     int verbose;
     const char *output_file;
+    calc_backend_t backend;
 } opts = {
     .terms = 5,
     .intensity = 1,
     .tile_words = DEFAULT_TILE_WORDS,
     .verbose = 1,
     .output_file = NULL
+    , .backend = DEFAULT_CALC_BACKEND
 };
 
 /* Progress tracking */
 volatile word_t current_progress = 0;
 volatile word_t secs = 0;
 volatile word_t end_progress = 0;
+
+static const char *backend_name(calc_backend_t backend)
+{
+    switch (backend) {
+        case CALC_BACKEND_LEGACY:
+            return "legacy";
+        case CALC_BACKEND_MXI:
+            return "mxi";
+        default:
+            return "unknown";
+    }
+}
+
+static int backend_supported(calc_backend_t backend)
+{
+    switch (backend) {
+        case CALC_BACKEND_LEGACY:
+            return 1;
+        case CALC_BACKEND_MXI:
+            return HAVE_MXI_BACKEND;
+        default:
+            return 0;
+    }
+}
+
+static calc_backend_t parse_backend(const char *value, int *ok)
+{
+    if (strcmp(value, "legacy") == 0) {
+        *ok = 1;
+        return CALC_BACKEND_LEGACY;
+    }
+    if (strcmp(value, "mxi") == 0) {
+        *ok = 1;
+        return CALC_BACKEND_MXI;
+    }
+    *ok = 0;
+    return CALC_BACKEND_LEGACY;
+}
+
+static calc_backend_t resolve_backend(calc_backend_t requested)
+{
+    if (requested == CALC_BACKEND_MXI && !backend_supported(CALC_BACKEND_MXI)) {
+        fprintf(stderr, "mxi backend is unavailable on this platform; falling back to legacy\n");
+        return CALC_BACKEND_LEGACY;
+    }
+    return requested;
+}
 
 void display(union sigval sigval)
 {
@@ -152,8 +226,9 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits, FILE *out)
         /* Phase 2: Sequential carry propagation between tiles */
         word_t running_carry = 0;
         for (ssize_t t = (ssize_t)num_tiles - 1; t >= 0; t--) {
-            size_t start = t * opts.tile_words;
-            size_t tile_end = (t + 1 == num_tiles) ? n : (t + 1) * opts.tile_words;
+            size_t tile_index = (size_t)t;
+            size_t start = tile_index * opts.tile_words;
+            size_t tile_end = (tile_index + 1 == num_tiles) ? n : (tile_index + 1) * opts.tile_words;
 
             if (running_carry != 0) {
                 ssize_t i = (ssize_t)tile_end - 1;
@@ -337,6 +412,200 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
     }
 }
 
+#if HAVE_MXI_BACKEND
+static inline uint64_t computeM_u32(uint32_t d)
+{
+    return UINT64_C(0xFFFFFFFFFFFFFFFF) / d + 1;
+}
+
+static inline uint32_t lfixdiv_2mul(uint32_t * restrict efrac, size_t current, uint64_t reciprocal, uint32_t divisor, uint32_t remainder)
+{
+    uint64_t tmp_partial_dividend = ((uint64_t)remainder << 32) | efrac[current];
+    uint32_t quotient = (uint32_t)(((__uint128_t)reciprocal * tmp_partial_dividend) >> 64);
+    efrac[current] = quotient;
+    return (uint32_t)(tmp_partial_dividend - (uint64_t)quotient * divisor);
+}
+
+static inline void init_mxi_batch(
+    uint32_t * restrict divisors,
+    uint64_t * restrict reciprocals,
+    uint32_t * restrict remainders,
+    word_t divisor_start,
+    word_t intensity
+)
+{
+    for (size_t i = 0; i < intensity; i++) {
+        remainders[i] = 1;
+        divisors[i] = (uint32_t)(divisor_start - i);
+        reciprocals[i] = computeM_u32(divisors[i]);
+    }
+}
+
+static void efrac_calc_2mul(
+    uint32_t * restrict efrac,
+    size_t start,
+    size_t end,
+    const uint64_t * restrict reciprocals,
+    const uint32_t * restrict divisors,
+    uint32_t * restrict remainders,
+    word_t intensity
+)
+{
+    if (intensity == 0 || reciprocals == NULL || divisors == NULL || end <= start)
+        return;
+
+    size_t i;
+    for (i = start; i + 1 < end; i += 2)
+    {
+        remainders[0] = lfixdiv_2mul(efrac, i, reciprocals[0], divisors[0], remainders[0]);
+        for (word_t j = 1; j < intensity; j++)
+        {
+            remainders[j - 1] = lfixdiv_2mul(efrac, i + 1, reciprocals[j - 1], divisors[j - 1], remainders[j - 1]);
+            remainders[j + 0] = lfixdiv_2mul(efrac, i + 0, reciprocals[j + 0], divisors[j + 0], remainders[j + 0]);
+        }
+        remainders[intensity - 1] = lfixdiv_2mul(efrac, i + 1, reciprocals[intensity - 1], divisors[intensity - 1], remainders[intensity - 1]);
+    }
+    if (i != end) {
+        for (word_t j = 0; j < intensity; j++)
+        {
+            remainders[j] = lfixdiv_2mul(efrac, i, reciprocals[j], divisors[j], remainders[j]);
+        }
+    }
+}
+
+#define SPIN_TIMES (1000)
+static inline void wait_pipeline(volatile uint32_t *a, int64_t b)
+{
+    uint32_t val = *a;
+    for (size_t i = SPIN_TIMES; val <= b; i--) {
+        if (i == 0) {
+            i = SPIN_TIMES;
+            syscall(SYS_futex, a, FUTEX_WAIT, val, NULL);
+        }
+        val = *a;
+    }
+}
+
+static inline void notify_pipeline(uint32_t * restrict a, volatile uint32_t * restrict b, int64_t offset)
+{
+    if (*b == (offset + (*a)++))
+        syscall(SYS_futex, a, FUTEX_WAKE, 1, NULL);
+}
+
+static inline int ecalc_mxi(uint32_t *efrac, size_t limb_count, word_t terms, word_t intensity)
+{
+    if (terms > UINT32_MAX) {
+        return 1;
+    }
+
+    size_t maxt = omp_get_max_threads();
+    const size_t interthread_buffer = 4;
+    int64_t buffer_size = (int64_t)maxt * (int64_t)interthread_buffer;
+    uint32_t (*remainders)[intensity] = calloc((size_t)buffer_size, sizeof(*remainders));
+    uint64_t (*reciprocals)[intensity] = calloc((size_t)buffer_size, sizeof(*reciprocals));
+    uint32_t (*divisors)[intensity] = calloc((size_t)buffer_size, sizeof(*divisors));
+    uint32_t *sync = calloc(maxt, sizeof(*sync));
+
+    if (remainders == NULL || reciprocals == NULL || divisors == NULL || sync == NULL) {
+        fprintf(stderr, "Error: allocation failed in mxi backend\n");
+        free(remainders);
+        free(reciprocals);
+        free(divisors);
+        free(sync);
+        exit(1);
+    }
+
+    memset(remainders, 0, (size_t)buffer_size * sizeof(*remainders));
+
+    if (maxt == 1 || limb_count < maxt)
+    {
+        fprintf(stderr, "calculating e with 1 thread (mxi)\n");
+        word_t divisor;
+        for (divisor = terms; divisor > intensity; divisor -= intensity)
+        {
+            init_mxi_batch(divisors[0], reciprocals[0], remainders[0], divisor, intensity);
+            efrac_calc_2mul(efrac, 0, limb_count, reciprocals[0], divisors[0], remainders[0], intensity);
+            current_progress += intensity;
+        }
+
+        init_mxi_batch(divisors[0], reciprocals[0], remainders[0], divisor, divisor - 1);
+        efrac_calc_2mul(efrac, 0, limb_count, reciprocals[0], divisors[0], remainders[0], divisor - 1);
+        current_progress += divisor - 1;
+    }
+    else
+    {
+        fprintf(stderr, "calculating e with %zu threads (mxi), intensity = %zu\n", maxt, (size_t)intensity);
+        memset(sync, 0, maxt * sizeof(*sync));
+
+        size_t chunk_size = limb_count / maxt;
+        #pragma omp parallel default(shared)
+        {
+            int t = omp_get_thread_num();
+            size_t start = (size_t)t * chunk_size;
+            size_t end = (size_t)(t + 1) * chunk_size;
+            if (t == (int)maxt - 1)
+                end = limb_count;
+            uint64_t divisor;
+            uint64_t buf_idx = 0;
+
+            if (t == 0) {
+                for (divisor = terms; divisor > intensity; divisor -= intensity)
+                {
+                    wait_pipeline(sync + maxt - 1, ((int64_t)sync[t]) - buffer_size);
+                    init_mxi_batch(divisors[buf_idx], reciprocals[buf_idx], remainders[buf_idx], divisor, intensity);
+                    efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], intensity);
+                    buf_idx = ((buf_idx + 1) == (uint64_t)buffer_size) ? 0 : buf_idx + 1;
+                    notify_pipeline(sync + t, sync + t + 1, 0);
+                }
+                init_mxi_batch(divisors[buf_idx], reciprocals[buf_idx], remainders[buf_idx], divisor, divisor - 1);
+                wait_pipeline(sync + maxt - 1, (int64_t)sync[t] - buffer_size);
+                    efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], divisor - 1);
+                notify_pipeline(sync + t, sync + t + 1, 0);
+            } else if (t == (int)maxt - 1) {
+                for (divisor = terms; divisor > intensity; divisor -= intensity)
+                {
+                    wait_pipeline(sync + t - 1, sync[t]);
+                    efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], intensity);
+                    buf_idx = ((buf_idx + 1) == (uint64_t)buffer_size) ? 0 : buf_idx + 1;
+                    notify_pipeline(sync + t, sync + 0, buffer_size);
+                    #pragma omp atomic
+                    current_progress += intensity;
+                }
+                wait_pipeline(sync + t - 1, sync[t]);
+                    efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], divisor - 1);
+                notify_pipeline(sync + t, sync + 0, buffer_size);
+                #pragma omp atomic
+                current_progress += divisor - 1;
+            } else {
+                for (divisor = terms; divisor > intensity; divisor -= intensity)
+                {
+                    wait_pipeline(sync + t - 1, sync[t]);
+                    efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], intensity);
+                    buf_idx = ((buf_idx + 1) == (uint64_t)buffer_size) ? 0 : buf_idx + 1;
+                    notify_pipeline(sync + t, sync + t + 1, 0);
+                }
+                wait_pipeline(sync + t - 1, sync[t]);
+                efrac_calc_2mul(efrac, start, end, reciprocals[buf_idx], divisors[buf_idx], remainders[buf_idx], divisor - 1);
+                notify_pipeline(sync + t, sync + t + 1, 0);
+            }
+        }
+    }
+
+    free(remainders);
+    free(reciprocals);
+    free(divisors);
+    free(sync);
+    return 0;
+}
+
+static void pack_u32_fraction(const uint32_t *src, word_t *dst, size_t words)
+{
+    for (size_t i = 0; i < words; i++) {
+        dst[i] = ((word_t)src[i * 2] << 32) | (word_t)src[i * 2 + 1];
+    }
+}
+#endif
+
 void usage(const char *prog)
 {
     fprintf(stderr,
@@ -346,6 +615,7 @@ void usage(const char *prog)
         "  -t TERMS      Number of terms (default: 5)\n"
         "  -i INTENSITY  Intensity for core calculation (default: 1)\n"
         "  -T TILE       Tile size in words for decimal conversion (default: 4096)\n"
+        "  --impl=NAME   Calculation backend: legacy or mxi (default: %s)\n"
         "  -o FILE       Output to file instead of stdout\n"
         "  -q            Quiet mode (no progress output)\n"
         "  -h            Show this help\n"
@@ -354,15 +624,20 @@ void usage(const char *prog)
         "  %s -t 1000000 -i 256 -T 4096          # Large computation to stdout\n"
         "  %s -t 100000 -i 64 -o e_100k.txt      # Output to file\n"
         "  %s -t 1000000 -i 256 -q -o e.txt      # Quiet mode, output to file\n",
-        prog, prog, prog, prog
+        prog, backend_name(DEFAULT_CALC_BACKEND), prog, prog, prog
     );
 }
 
 int main(int argc, char **argv)
 {
     int opt;
+    int option_index = 0;
+    static const struct option long_options[] = {
+        {"impl", required_argument, NULL, 1000},
+        {0, 0, 0, 0}
+    };
 
-    while ((opt = getopt(argc, argv, "t:i:T:o:qh")) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:i:T:o:qh", long_options, &option_index)) != -1) {
         switch (opt) {
             case 't':
                 opts.terms = strtoull(optarg, NULL, 10);
@@ -382,6 +657,15 @@ int main(int argc, char **argv)
             case 'h':
                 usage(argv[0]);
                 return 0;
+            case 1000: {
+                int ok = 0;
+                opts.backend = parse_backend(optarg, &ok);
+                if (!ok) {
+                    fprintf(stderr, "Error: invalid backend '%s'\n", optarg);
+                    return 1;
+                }
+                break;
+            }
             default:
                 usage(argv[0]);
                 return 1;
@@ -397,6 +681,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: Invalid intensity\n");
         return 1;
     }
+
+    opts.backend = resolve_backend(opts.backend);
+    fprintf(stderr, "using calculation backend: %s\n", backend_name(opts.backend));
 
     end_progress = opts.terms;
 
@@ -434,7 +721,40 @@ int main(int argc, char **argv)
     }
 
     /* Calculate e */
-    ecalc(efrac, efrac_size, opts.terms, opts.intensity);
+    if (opts.backend == CALC_BACKEND_MXI) {
+#if HAVE_MXI_BACKEND
+        size_t efrac32_size = efrac_size * 2;
+        uint32_t *efrac32 = calloc(efrac32_size, sizeof(uint32_t));
+        if (efrac32 == NULL) {
+            perror("calloc");
+            free(efrac);
+            return 1;
+        }
+
+        if (ecalc_mxi(efrac32, efrac32_size, opts.terms, opts.intensity) == 0) {
+            word_t *packed = calloc(efrac_size, sizeof(word_t));
+            if (packed == NULL) {
+                perror("calloc");
+                free(efrac32);
+                free(efrac);
+                return 1;
+            }
+            pack_u32_fraction(efrac32, packed, efrac_size);
+            free(efrac32);
+            free(efrac);
+            efrac = packed;
+        } else {
+            fprintf(stderr, "mxi backend cannot handle this input; falling back to legacy calculation core\n");
+            free(efrac32);
+            ecalc(efrac, efrac_size, opts.terms, opts.intensity);
+        }
+#else
+        fprintf(stderr, "mxi backend is unavailable on this platform; falling back to legacy calculation core\n");
+        ecalc(efrac, efrac_size, opts.terms, opts.intensity);
+#endif
+    } else {
+        ecalc(efrac, efrac_size, opts.terms, opts.intensity);
+    }
 
     putc('\n', stderr);
 
