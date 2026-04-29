@@ -154,17 +154,19 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits, FILE *out)
         for (ssize_t t = (ssize_t)num_tiles - 1; t >= 0; t--) {
             size_t start = t * opts.tile_words;
             size_t tile_end = (t + 1 == num_tiles) ? n : (t + 1) * opts.tile_words;
-            
-            dword_t sum = (dword_t)dst[start] + running_carry;
-            dst[start] = (word_t)sum;
-            running_carry = (word_t)(sum >> WORD_SIZE);
 
-            for (size_t i = start + 1;
-                 i < tile_end && running_carry;
-                 i++) {
-                dword_t sum = (dword_t)dst[i] + running_carry;
-                dst[i] = (word_t)sum;
-                running_carry = (word_t)(sum >> WORD_SIZE);
+            if (running_carry != 0) {
+                ssize_t i = (ssize_t)tile_end - 1;
+                while (1) {
+                    dword_t sum = (dword_t)dst[i] + running_carry;
+                    dst[i] = (word_t)sum;
+                    running_carry = (word_t)(sum >> WORD_SIZE);
+
+                    if (running_carry == 0 || i == (ssize_t)start) {
+                        break;
+                    }
+                    i--;
+                }
             }
 
             running_carry += tile_carries[t];
