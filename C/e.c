@@ -2,8 +2,14 @@
  * Optimized e calculator with tiled decimal conversion and getopt
  * Based on Neo_Chen's original e.c
  *
+ * Credits:
+ * - Original algorithm by Steve Wozniak (1980)
+ * - Parallel pipeline by Neo_Chen
+ * - Futex-based lockless pipeline + 32-bit division optimization by mxi-box
+ * - Tiled decimal conversion + getopt by Lena Lamport
+ *
  * Compile: gcc -O3 -march=native -fopenmp e_optimized.c -o e_optimized
- * Usage: ./e_optimized [-t terms] [-i intensity] [-T tile_size] [-h]
+ * Usage: ./e_optimized [-t terms] [-i intensity] [-T tile_size] [-o file] [-q] [-h]
  */
 
 #define _GNU_SOURCE
@@ -39,11 +45,13 @@ struct {
     word_t intensity;
     size_t tile_words;
     int verbose;
+    const char *output_file;
 } opts = {
     .terms = 5,
     .intensity = 1,
     .tile_words = DEFAULT_TILE_WORDS,
-    .verbose = 1
+    .verbose = 1,
+    .output_file = NULL
 };
 
 /* Progress tracking */
@@ -101,6 +109,7 @@ static inline word_t lfixmul(word_t *frac, word_t mul, word_t carry_in)
 
 /*
  * Tiled decimal conversion - optimized for cache locality
+ * Progress tracking included
  */
 static inline word_t process_tile(
     const word_t * restrict input,
@@ -117,7 +126,7 @@ static inline word_t process_tile(
     return carry;
 }
 
-void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
+void print_fraction_tiled(word_t *frac, size_t n, size_t digits, FILE *out)
 {
     size_t num_tiles = (n + opts.tile_words - 1) / opts.tile_words;
     word_t *tile_carries = calloc(num_tiles, sizeof(word_t));
@@ -129,7 +138,7 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
     end_progress = total_groups;
     current_progress = 0;
 
-    printf("e = 2.");
+    fprintf(out, "e = 2.");
 
     for (size_t g = 0; g < total_groups; g++) {
         /* Phase 1: Process all tiles in parallel */
@@ -161,7 +170,7 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
             running_carry += tile_carries[t];
         }
 
-        printf("%019" PRIu64, running_carry);
+        fprintf(out, "%019" PRIu64, running_carry);
         current_progress++;
 
         /* Swap src/dst for next iteration */
@@ -188,59 +197,13 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
         }
         char fmtspec[32];
         sprintf(fmtspec, "%%0%zu" PRIu64, rest);
-        printf(fmtspec, carry);
+        fprintf(out, fmtspec, carry);
     }
 
-    putchar('\n');
+    fputc('\n', out);
 
     free(tile_carries);
     free(temp);
-}
-
-/*
- * Original print_fraction for comparison (intensity-based)
- */
-void print_fraction_original(word_t *frac, size_t n, size_t digits, word_t intensity)
-{
-    word_t *carrys = malloc(intensity * sizeof(word_t));
-
-    for (size_t i = 0; i < digits / (GROUP_SIZE * intensity); i++)
-    {
-        for (size_t j = 0; j < intensity; j++)
-            carrys[j] = 0;
-        for (ssize_t j = n - 1; j >= 0; j--)
-        {
-            for (size_t k = 0; k < intensity; k++)
-                carrys[k] = lfixmul(&frac[j], pow10_19, carrys[k]);
-        }
-        for (size_t j = 0; j < intensity; j++)
-            printf("%019" PRIu64, carrys[j]);
-    }
-
-    size_t rest = digits % (GROUP_SIZE * intensity);
-    size_t rest_intensity = rest / GROUP_SIZE;
-
-    for (size_t j = 0; j < rest_intensity; j++)
-        carrys[j] = 0;
-    for (ssize_t j = n - 1; j >= 0; j--)
-    {
-        for (size_t k = 0; k < rest_intensity; k++)
-            carrys[k] = lfixmul(&frac[j], pow10_19, carrys[k]);
-    }
-    for (size_t j = 0; j < rest_intensity; j++)
-        printf("%019" PRIu64, carrys[j]);
-
-    rest %= GROUP_SIZE;
-    word_t carry = 0;
-    word_t pow10 = intpow10(rest);
-    for (ssize_t j = n - 1; j >= 0; j--)
-        carry = lfixmul(&frac[j], pow10, carry);
-
-    char fmtspec[32];
-    sprintf(fmtspec, "%%0%zu" PRIu64, rest);
-    printf(fmtspec, carry);
-
-    free(carrys);
 }
 
 /* Core e calculation - unchanged from original */
@@ -363,6 +326,7 @@ static inline void ecalc(word_t *efrac, size_t efrac_size, word_t terms, word_t 
             divisors_pipeline[0] = 0;
             ecalc_parallel(efrac_size, efrac, remaining_intensity, remainders, divisors_pipeline);
         }
+
     }
 }
 
@@ -375,23 +339,23 @@ void usage(const char *prog)
         "  -t TERMS      Number of terms (default: 5)\n"
         "  -i INTENSITY  Intensity for core calculation (default: 1)\n"
         "  -T TILE       Tile size in words for decimal conversion (default: 4096)\n"
-        "  -o            Use original (non-tiled) decimal conversion\n"
+        "  -o FILE       Output to file instead of stdout\n"
         "  -q            Quiet mode (no progress output)\n"
         "  -h            Show this help\n"
         "\n"
         "Examples:\n"
-        "  %s -t 1000000 -i 256 -T 4096    # Large computation with tiled conversion\n"
-        "  %s -t 100000 -i 64 -o           # Use original decimal conversion\n",
-        prog, prog, prog
+        "  %s -t 1000000 -i 256 -T 4096          # Large computation to stdout\n"
+        "  %s -t 100000 -i 64 -o e_100k.txt      # Output to file\n"
+        "  %s -t 1000000 -i 256 -q -o e.txt      # Quiet mode, output to file\n",
+        prog, prog, prog, prog
     );
 }
 
 int main(int argc, char **argv)
 {
-    int use_tiled = 1;
     int opt;
 
-    while ((opt = getopt(argc, argv, "t:i:T:oqvh")) != -1) {
+    while ((opt = getopt(argc, argv, "t:i:T:o:qh")) != -1) {
         switch (opt) {
             case 't':
                 opts.terms = strtoull(optarg, NULL, 10);
@@ -403,7 +367,7 @@ int main(int argc, char **argv)
                 opts.tile_words = strtoull(optarg, NULL, 10);
                 break;
             case 'o':
-                use_tiled = 0;
+                opts.output_file = optarg;
                 break;
             case 'q':
                 opts.verbose = 0;
@@ -472,13 +436,28 @@ int main(int argc, char **argv)
     current_progress = 0;
 
     fprintf(stderr, "Printing...\n");
-    if (use_tiled) {
-        fprintf(stderr, "Using tiled conversion (tile=%zu words)...\n", opts.tile_words);
-        print_fraction_tiled(efrac, efrac_size, digits);
-    } else {
-        fprintf(stderr, "Using original conversion (intensity=%" PRIu64 ")...\n", opts.intensity);
-        printf("e = 2.");
-        print_fraction_original(efrac, efrac_size, digits, opts.intensity);
+    
+    /* Set up output stream */
+    FILE *out = stdout;
+    if (opts.output_file != NULL) {
+        out = fopen(opts.output_file, "w");
+        if (out == NULL) {
+            perror("fopen");
+            free(efrac);
+            return 1;
+        }
+    }
+    
+    /* Set up progress timer for printing */
+    if (opts.verbose) {
+        timer_settime(timer, TIMER_ABSTIME, &period, NULL);
+    }
+    
+    print_fraction_tiled(efrac, efrac_size, digits, out);
+    
+    if (opts.output_file != NULL) {
+        fclose(out);
+        fprintf(stderr, "\nOutput written to %s\n", opts.output_file);
     }
 
     timer_delete(timer);
