@@ -120,8 +120,8 @@ static inline word_t process_tile(
 void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
 {
     size_t num_tiles = (n + opts.tile_words - 1) / opts.tile_words;
-    word_t *tile_carries = malloc(num_tiles * sizeof(word_t));
-    word_t *temp = malloc(n * sizeof(word_t));
+    word_t *tile_carries = calloc(num_tiles, sizeof(word_t));
+    word_t *temp = calloc(n, sizeof(word_t));
     word_t *src = frac;
     word_t *dst = temp;
 
@@ -144,12 +144,14 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
         word_t running_carry = 0;
         for (ssize_t t = (ssize_t)num_tiles - 1; t >= 0; t--) {
             size_t start = t * opts.tile_words;
+            size_t tile_end = (t + 1 == num_tiles) ? n : (t + 1) * opts.tile_words;
+            
             dword_t sum = (dword_t)dst[start] + running_carry;
             dst[start] = (word_t)sum;
             running_carry = (word_t)(sum >> WORD_SIZE);
 
             for (size_t i = start + 1;
-                 i < start + opts.tile_words && i < n && running_carry;
+                 i < tile_end && running_carry;
                  i++) {
                 dword_t sum = (dword_t)dst[i] + running_carry;
                 dst[i] = (word_t)sum;
@@ -166,6 +168,9 @@ void print_fraction_tiled(word_t *frac, size_t n, size_t digits)
         word_t *swap = src;
         src = dst;
         dst = swap;
+        
+        /* Clear dst before next use to avoid stale data */
+        memset(dst, 0, n * sizeof(word_t));
     }
 
     /* If result ended up in temp, copy back */
@@ -472,6 +477,7 @@ int main(int argc, char **argv)
         print_fraction_tiled(efrac, efrac_size, digits);
     } else {
         fprintf(stderr, "Using original conversion (intensity=%" PRIu64 ")...\n", opts.intensity);
+        printf("e = 2.");
         print_fraction_original(efrac, efrac_size, digits, opts.intensity);
     }
 
