@@ -31,12 +31,14 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <signal.h>
 #include <time.h>
 #include <math.h>
 #include <float.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <errno.h>
 #include <string.h>
 #include <getopt.h>
 #include <unistd.h>
@@ -65,6 +67,10 @@
 typedef uint64_t     word_t;
 typedef __uint128_t  dword_t;
 typedef uint8_t      byte;
+typedef _Atomic uint32_t atomic_u32;
+
+_Static_assert(sizeof(atomic_u32) == sizeof(uint32_t),
+               "atomic_u32 must be futex-compatible");
 
 #if __SIZEOF_INT128__ != 16
 #error "No 128-bit integer support"
@@ -101,9 +107,9 @@ struct {
 
 // ====================== Progress Tracking =====================
 
-volatile word_t current_progress = 0;
-volatile word_t secs             = 0;
-volatile word_t end_progress     = 0;
+static _Atomic word_t current_progress = 0;
+static _Atomic word_t secs             = 0;
+static _Atomic word_t end_progress     = 0;
 
 // ====================== Backend Helpers =======================
 
@@ -143,6 +149,33 @@ static calc_backend_t resolve_backend(calc_backend_t requested)
     return requested;
 }
 
+static bool parse_word_arg(const char *value, word_t *out)
+{
+    char *end = NULL;
+
+    if (value == NULL || value[0] == '\0' || value[0] == '-')
+        return false;
+
+    errno = 0;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0')
+        return false;
+
+    *out = (word_t)parsed;
+    return true;
+}
+
+static bool parse_size_arg(const char *value, size_t *out)
+{
+    word_t parsed;
+
+    if (!parse_word_arg(value, &parsed) || parsed > SIZE_MAX)
+        return false;
+
+    *out = (size_t)parsed;
+    return true;
+}
+
 // ============ Precision Estimation & Utilities ================
 
 /*
@@ -151,15 +184,16 @@ static calc_backend_t resolve_backend(calc_backend_t requested)
  */
 static double log2_factorial(word_t n)
 {
+    double value = (double)n;
     return log2(2 * M_PI) / 2
-         + log2(n) * (n + 0.5)
-         - n / log(2);
+         + log2(value) * (value + 0.5)
+         - value / log(2);
 }
 
 /* Estimate how many decimal digits a word-array of size `n` can hold */
 static size_t estimate_decimal_digits(size_t n, size_t word_size)
 {
-    return (size_t)floor(log(2) / log(10) * n * word_size);
+    return (size_t)floor(log(2) / log(10) * (double)n * (double)word_size);
 }
 
 /* Compute 10^n for small n (n <= 19 so it fits in uint64_t) */
@@ -287,6 +321,11 @@ static void print_fraction_tiled(
     size_t  digit_count,
     FILE   *out
 ) {
+    if (digit_count == 0) {
+        fprintf(out, "e = 2.\n");
+        return;
+    }
+
     size_t num_tiles = (word_count + opts.tile_words - 1)
                        / opts.tile_words;
     word_t *tile_carries = calloc(num_tiles, sizeof(word_t));
@@ -300,8 +339,8 @@ static void print_fraction_tiled(
     }
 
     size_t total_groups = digit_count / GROUP_SIZE;
-    end_progress = total_groups;
-    current_progress = 0;
+    atomic_store_explicit(&end_progress, total_groups, memory_order_relaxed);
+    atomic_store_explicit(&current_progress, 0, memory_order_relaxed);
 
     fprintf(out, "e = 2.");
 
@@ -325,19 +364,20 @@ static void print_fraction_tiled(
 
         fprintf(out, "%019" PRIu64, running_carry);
 
-        /* Insert newline every 4 groups for readability */
-        if ((current_progress & 0x3) == 0)
+        /*
+         * The first line already contains "e = 2.", so the early newline
+         * keeps later wrapped lines visually tucked under the digits.
+         */
+        if ((group & 0x3) == 0)
             fputc('\n', out);
 
-        current_progress++;
+        atomic_fetch_add_explicit(&current_progress, 1, memory_order_relaxed);
 
         /* Swap src/dst for next iteration (ping-pong buffer) */
         word_t *swap = src;
         src = dst;
         dst = swap;
 
-        /* Clear the recycled buffer to avoid stale data */
-        memset(dst, 0, word_count * sizeof(word_t));
     }
 
     /* If result ended up in temp, copy back to fraction */
@@ -352,9 +392,7 @@ static void print_fraction_tiled(
         for (ssize_t j = (ssize_t)word_count - 1; j >= 0; j--)
             carry = frac_mul(&fraction[j], pow10, carry);
 
-        char fmt[32];
-        snprintf(fmt, sizeof(fmt), "%%0%zu" PRIu64, remaining);
-        fprintf(out, fmt, carry);
+        fprintf(out, "%0*" PRIu64, (int)remaining, carry);
     }
 
     fputc('\n', out);
@@ -368,21 +406,26 @@ static void print_fraction_tiled(
 static void progress_report(union sigval sv)
 {
     (void)sv;
-    static word_t last = 0;
+    static _Atomic word_t last = 0;
 
-    if (last > end_progress)
-        last = 0;
+    word_t current = atomic_load_explicit(&current_progress, memory_order_relaxed);
+    word_t end = atomic_load_explicit(&end_progress, memory_order_relaxed);
+    word_t previous = atomic_load_explicit(&last, memory_order_relaxed);
 
-    secs += 1;
+    if (previous > end || previous > current)
+        previous = 0;
+
+    word_t elapsed = atomic_fetch_add_explicit(&secs, 1, memory_order_relaxed) + 1;
+    double percent = (end == 0) ? 100.0 : (double)current * 100.0 / (double)end;
     fprintf(stderr,
-        ">%7.3f%% (%" PRIu64 "/%" PRIu64 ") @ %zu op/s (%zu op/s avg.)\n",
-        (float)current_progress * 100 / end_progress,
-        current_progress,
-        end_progress,
-        current_progress - last,
-        current_progress / secs
+        ">%7.3f%% (%" PRIu64 "/%" PRIu64 ") @ %" PRIu64 " op/s (%" PRIu64 " op/s avg.)\n",
+        percent,
+        current,
+        end,
+        current - previous,
+        current / elapsed
     );
-    last = current_progress;
+    atomic_store_explicit(&last, current, memory_order_relaxed);
 }
 
 // ================== Pipeline Shift Helper =====================
@@ -457,7 +500,6 @@ static inline void parallel_division_pass(
                               intensity);
     }
 
-    #pragma omp barrier
     /* Propagate remainders from thread i-1 to thread i */
     for (int i = omp_get_max_threads() - 1; i > 0; i--)
         memcpy(remainders[i], remainders[i - 1],
@@ -487,7 +529,7 @@ static void compute_e_legacy(
                 remainders[0][i] = 1;
             fraction_compute_pass(fraction, 0, fraction_size,
                                   divisor, remainders[0], intensity);
-            current_progress += intensity;
+            atomic_fetch_add_explicit(&current_progress, intensity, memory_order_relaxed);
         }
 
         word_t remaining = terms % intensity;
@@ -495,7 +537,7 @@ static void compute_e_legacy(
             remainders[0][i] = 1;
         fraction_compute_pass(fraction, 0, fraction_size,
                               remaining, remainders[0], remaining);
-        current_progress += remaining;
+        atomic_fetch_add_explicit(&current_progress, remaining, memory_order_relaxed);
     } else {
         fprintf(stderr, "calculating e with %d threads, intensity = %zu\n",
                 num_threads, (size_t)intensity);
@@ -505,7 +547,7 @@ static void compute_e_legacy(
             shift_pipeline(divisors_pipeline, (size_t)num_threads, divisor);
             parallel_division_pass(fraction_size, fraction, intensity,
                                    remainders, divisors_pipeline);
-            current_progress += intensity;
+            atomic_fetch_add_explicit(&current_progress, intensity, memory_order_relaxed);
         }
 
         /* Drain the pipeline (flush stale divisors) */
@@ -521,7 +563,7 @@ static void compute_e_legacy(
             shift_pipeline(divisors_pipeline, (size_t)num_threads, remaining);
             parallel_division_pass(fraction_size, fraction, remaining,
                                    remainders, divisors_pipeline);
-            current_progress += remaining;
+            atomic_fetch_add_explicit(&current_progress, remaining, memory_order_relaxed);
 
             fprintf(stderr, "Finalizing...\n");
             /* Another drain to finish off */
@@ -626,26 +668,29 @@ static void fraction_compute_pass_reciprocal(
 /* ---- Futex-based pipeline synchronisation ----------------- */
 #define SPIN_TIMES 1000
 
-static inline void pipeline_wait(volatile uint32_t *sync, int64_t expected)
+static inline void pipeline_wait(atomic_u32 *sync, int64_t expected)
 {
-    uint32_t val = *sync;
+    uint32_t val = atomic_load_explicit(sync, memory_order_acquire);
     for (size_t i = SPIN_TIMES; (int64_t)val <= expected; i--) {
 
         if (i == 0) {
             i = SPIN_TIMES;
-            syscall(SYS_futex, sync, FUTEX_WAIT, val, NULL);
+            syscall(SYS_futex, (uint32_t *)(void *)sync, FUTEX_WAIT, val, NULL);
         }
-        val = *sync;
+        val = atomic_load_explicit(sync, memory_order_acquire);
     }
 }
 
 static inline void pipeline_notify(
-    uint32_t *restrict sync,
-    volatile uint32_t *restrict next_sync,
+    atomic_u32 *restrict sync,
+    atomic_u32 *restrict next_sync,
     int64_t offset
 ) {
-    if (*next_sync == (offset + (uint32_t)(*sync)++))
-        syscall(SYS_futex, sync, FUTEX_WAKE, 1, NULL);
+    uint32_t next = atomic_load_explicit(next_sync, memory_order_acquire);
+    uint32_t old = atomic_fetch_add_explicit(sync, 1, memory_order_release);
+
+    if ((int64_t)next == offset + (int64_t)old)
+        syscall(SYS_futex, (uint32_t *)(void *)sync, FUTEX_WAKE, 1, NULL);
 }
 
 /* ---- MXI backend entry point ------------------------------ */
@@ -679,7 +724,7 @@ static int compute_e_mxi(
     uint32_t (*remainders)[intensity]  = calloc((size_t)buffer_size, sizeof(*remainders));
     uint64_t (*reciprocals)[intensity] = calloc((size_t)buffer_size, sizeof(*reciprocals));
     uint32_t (*divisors)[intensity]    = calloc((size_t)buffer_size, sizeof(*divisors));
-    uint32_t *sync                     = calloc(num_threads, sizeof(*sync));
+    atomic_u32 *sync                   = calloc(num_threads, sizeof(*sync));
 
     if (!remainders || !reciprocals || !divisors || !sync) {
         fprintf(stderr, "Error: allocation failed in mxi backend\n");
@@ -703,7 +748,7 @@ static int compute_e_mxi(
             fraction_compute_pass_reciprocal(fraction, 0, limb_count,
                                              reciprocals[0], divisors[0],
                                              remainders[0], intensity);
-            current_progress += intensity;
+            atomic_fetch_add_explicit(&current_progress, intensity, memory_order_relaxed);
         }
 
         word_t last_count = divisor - 1;
@@ -714,11 +759,12 @@ static int compute_e_mxi(
                                              reciprocals[0], divisors[0],
                                              remainders[0], last_count);
         }
-        current_progress += last_count;
+        atomic_fetch_add_explicit(&current_progress, last_count, memory_order_relaxed);
     } else {
         fprintf(stderr, "calculating e with %zu threads (mxi), intensity = %zu\n",
                 num_threads, (size_t)intensity);
-        memset(sync, 0, num_threads * sizeof(*sync));
+        for (size_t i = 0; i < num_threads; i++)
+            atomic_init(&sync[i], 0);
 
         size_t chunk_size = limb_count / num_threads;
 
@@ -745,8 +791,10 @@ static int compute_e_mxi(
             for (divisor = terms; divisor > intensity; divisor -= intensity)
             {
                 if (thread_id == 0) {
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
                     pipeline_wait(sync + num_threads - 1,
-                                  (int64_t)sync[thread_id] - buffer_size);
+                                  (int64_t)sync_value - buffer_size);
                     init_mxi_batch(divisors[buf_idx], reciprocals[buf_idx],
                                    remainders[buf_idx], divisor, intensity);
                     fraction_compute_pass_reciprocal(
@@ -755,16 +803,20 @@ static int compute_e_mxi(
                         remainders[buf_idx], intensity);
                     pipeline_notify(sync + thread_id, sync + thread_id + 1, 0);
                 } else if (thread_id == (int)num_threads - 1) {
-                    pipeline_wait(sync + thread_id - 1, sync[thread_id]);
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
+                    pipeline_wait(sync + thread_id - 1, sync_value);
                     fraction_compute_pass_reciprocal(
                         fraction, start, end,
                         reciprocals[buf_idx], divisors[buf_idx],
                         remainders[buf_idx], intensity);
                     pipeline_notify(sync + thread_id, sync + 0, buffer_size);
-                    #pragma omp atomic
-                    current_progress += intensity;
+                    atomic_fetch_add_explicit(&current_progress, intensity,
+                                              memory_order_relaxed);
                 } else {
-                    pipeline_wait(sync + thread_id - 1, sync[thread_id]);
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
+                    pipeline_wait(sync + thread_id - 1, sync_value);
                     fraction_compute_pass_reciprocal(
                         fraction, start, end,
                         reciprocals[buf_idx], divisors[buf_idx],
@@ -780,8 +832,10 @@ static int compute_e_mxi(
             if (last_count > 0)
             {
                 if (thread_id == 0) {
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
                     pipeline_wait(sync + num_threads - 1,
-                                  (int64_t)sync[thread_id] - buffer_size);
+                                  (int64_t)sync_value - buffer_size);
                     init_mxi_batch(divisors[buf_idx], reciprocals[buf_idx],
                                    remainders[buf_idx], divisor, last_count);
                     fraction_compute_pass_reciprocal(
@@ -790,16 +844,20 @@ static int compute_e_mxi(
                         remainders[buf_idx], last_count);
                     pipeline_notify(sync + thread_id, sync + thread_id + 1, 0);
                 } else if (thread_id == (int)num_threads - 1) {
-                    pipeline_wait(sync + thread_id - 1, sync[thread_id]);
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
+                    pipeline_wait(sync + thread_id - 1, sync_value);
                     fraction_compute_pass_reciprocal(
                         fraction, start, end,
                         reciprocals[buf_idx], divisors[buf_idx],
                         remainders[buf_idx], last_count);
                     pipeline_notify(sync + thread_id, sync + 0, buffer_size);
-                    #pragma omp atomic
-                    current_progress += last_count;
+                    atomic_fetch_add_explicit(&current_progress, last_count,
+                                              memory_order_relaxed);
                 } else {
-                    pipeline_wait(sync + thread_id - 1, sync[thread_id]);
+                    uint32_t sync_value =
+                        atomic_load_explicit(sync + thread_id, memory_order_relaxed);
+                    pipeline_wait(sync + thread_id - 1, sync_value);
                     fraction_compute_pass_reciprocal(
                         fraction, start, end,
                         reciprocals[buf_idx], divisors[buf_idx],
@@ -879,13 +937,22 @@ int main(int argc, char **argv)
     {
         switch (opt) {
         case 't':
-            opts.terms = strtoull(optarg, NULL, 10);
+            if (!parse_word_arg(optarg, &opts.terms)) {
+                fprintf(stderr, "Error: invalid term count '%s'\n", optarg);
+                return 1;
+            }
             break;
         case 'i':
-            opts.intensity = strtoull(optarg, NULL, 10);
+            if (!parse_word_arg(optarg, &opts.intensity)) {
+                fprintf(stderr, "Error: invalid intensity '%s'\n", optarg);
+                return 1;
+            }
             break;
         case 'T':
-            opts.tile_words = strtoull(optarg, NULL, 10);
+            if (!parse_size_arg(optarg, &opts.tile_words)) {
+                fprintf(stderr, "Error: invalid tile size '%s'\n", optarg);
+                return 1;
+            }
             break;
         case 'o':
             opts.output_file = optarg;
@@ -919,12 +986,16 @@ int main(int argc, char **argv)
         fprintf(stderr, "Error: Invalid intensity\n");
         return 1;
     }
+    if (opts.tile_words == 0) {
+        fprintf(stderr, "Error: Invalid tile size\n");
+        return 1;
+    }
 
     opts.backend = resolve_backend(opts.backend);
     fprintf(stderr, "using calculation backend: %s\n",
             backend_name(opts.backend));
 
-    end_progress = opts.terms;
+    atomic_store_explicit(&end_progress, opts.terms, memory_order_relaxed);
 
     /* ---- Estimate precision & allocate fraction ------------ */
     double precision = log2_factorial(opts.terms);
@@ -933,7 +1004,7 @@ int main(int argc, char **argv)
             opts.terms, precision);
 
     size_t fraction_size = (size_t)ceil(precision / WORD_SIZE);
-    word_t *fraction = calloc(fraction_size, sizeof(word_t));
+    word_t *fraction = calloc(fraction_size ? fraction_size : 1, sizeof(word_t));
     if (!fraction) {
         perror("calloc");
         return 1;
@@ -963,7 +1034,7 @@ int main(int argc, char **argv)
         .it_interval.tv_nsec = 0
     };
 
-    current_progress = 0;
+    atomic_store_explicit(&current_progress, 0, memory_order_relaxed);
     if (opts.verbose)
         timer_settime(timer, TIMER_ABSTIME, &period, NULL);
 
@@ -971,7 +1042,7 @@ int main(int argc, char **argv)
     if (opts.backend == CALC_BACKEND_MXI) {
 #if HAVE_MXI_BACKEND
         size_t frac32_size = fraction_size * 2;
-        uint32_t *frac32 = calloc(frac32_size, sizeof(uint32_t));
+        uint32_t *frac32 = calloc(frac32_size ? frac32_size : 1, sizeof(uint32_t));
         if (!frac32) {
             perror("calloc");
             free(fraction);
@@ -981,7 +1052,7 @@ int main(int argc, char **argv)
         if (compute_e_mxi(frac32, frac32_size,
                           opts.terms, opts.intensity) == 0)
         {
-            word_t *packed = calloc(fraction_size, sizeof(word_t));
+            word_t *packed = calloc(fraction_size ? fraction_size : 1, sizeof(word_t));
             if (!packed) {
                 perror("calloc");
                 free(frac32);
@@ -1015,8 +1086,8 @@ int main(int argc, char **argv)
     fputc('\n', stderr);
 
     /* ---- Print result -------------------------------------- */
-    secs             = 0;
-    current_progress = 0;
+    atomic_store_explicit(&secs, 0, memory_order_relaxed);
+    atomic_store_explicit(&current_progress, 0, memory_order_relaxed);
     fprintf(stderr, "Printing...\n");
 
     FILE *out = stdout;
