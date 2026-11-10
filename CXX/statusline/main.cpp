@@ -184,6 +184,58 @@ std::string current_dir()
 	return ec ? std::string{} : from_path(p);
 }
 
+std::string home_dir()
+{
+#ifdef _WIN32
+	// _wgetenv: getenv() would hand back the ANSI codepage, not UTF-8
+	const wchar_t *h = _wgetenv(L"USERPROFILE");
+	return h ? narrow(h) : std::string{};
+#else
+	const char *h = std::getenv("HOME");
+	return h ? h : "";
+#endif
+}
+
+bool is_sep(char c)
+{
+#ifdef _WIN32
+	return c == '/' || c == '\\';
+#else
+	return c == '/';
+#endif
+}
+
+// Windows paths are case-insensitive and accept either separator
+bool same_path_char(char a, char b)
+{
+#ifdef _WIN32
+	if(is_sep(a) && is_sep(b))
+		return true;
+	auto lower = [](char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; };
+	return lower(a) == lower(b);
+#else
+	return a == b;
+#endif
+}
+
+// /home/neo_chen/vcs -> ~/vcs (only on a whole path component)
+std::string tilde(const std::string &path)
+{
+	std::string home = home_dir();
+	while(home.size() > 1 && is_sep(home.back()))
+		home.pop_back();
+	if(home.empty() || (home.size() == 1 && is_sep(home[0])) || path.size() < home.size())
+		return path;
+	for(std::size_t i = 0; i < home.size(); ++i)
+		if(!same_path_char(path[i], home[i]))
+			return path;
+	if(path.size() == home.size())
+		return "~";
+	if(!is_sep(path[home.size()]))
+		return path;
+	return "~" + path.substr(home.size());
+}
+
 // Equivalent of `git symbolic-ref --short HEAD`: walk up looking for .git
 // (a directory, or a gitdir: file for worktrees/submodules), read HEAD.
 std::string git_branch(const std::string &cwd)
@@ -242,7 +294,7 @@ constexpr std::string_view
 	label   = "90",    // bright black: labels, separators, secondary text
 	red     = "91",
 	green   = "92",
-	yellow  = "93",
+	yellow  = "93",    // also: session cost
 	blue    = "1;94",  // cwd
 	magenta = "95",    // model
 	cyan    = "96",    // branch
@@ -256,7 +308,6 @@ enum class Level { ok, warn, bad };
 Level hi(int n) { return n >= 80 ? Level::bad : n >= 60 ? Level::warn : Level::ok; }
 // lower is worse (rate limit remaining)
 Level lo(int n) { return n <= 20 ? Level::bad : n <= 40 ? Level::warn : Level::ok; }
-Level cost_level(double c) { return c >= 10 ? Level::bad : c >= 2 ? Level::warn : Level::ok; }
 
 std::string_view fg(Level l)
 {
@@ -344,14 +395,14 @@ std::string percent(int n) { return std::to_string(n) + "%"; }
 
 // ── render ───────────────────────────────────────────────────────────
 //
-// user@host /full/path branch | MODE | Model effort | ctx N% | 5h N% 7d N% | cache N% | $N.NN | +N -N | session
+// user@host ~/full/path branch | MODE | Model effort | ctx N% | 5h N% 7d N% | cache N% | $N.NN | +N -N | session
 
 std::string render(const Info &in)
 {
 	Line l;
 	const std::string sep = Line{}.c(sgr::label, " | ").s;
 
-	l.c(sgr::green, in.user + "@" + in.host).raw(" ").c(sgr::blue, in.cwd);
+	l.c(sgr::green, in.user + "@" + in.host).raw(" ").c(sgr::blue, tilde(in.cwd));
 	if(!in.branch.empty())
 		l.raw(" ").c(sgr::cyan, in.branch);
 	if(!in.vim.empty())
@@ -379,7 +430,7 @@ std::string render(const Info &in)
 	else if(in.hit)
 		l.raw(sep).c(sgr::label, "cache ").c(sgr::green, percent(*in.hit));
 	if(in.cost)
-		l.raw(sep).c(fg(cost_level(*in.cost)), money(*in.cost));
+		l.raw(sep).c(sgr::yellow, money(*in.cost));
 	if(in.added || in.removed)
 	{
 		l.raw(sep);
